@@ -1,4 +1,4 @@
-package io.devcon5.bitcoin.vertx.util;
+package io.devcon5.util;
 
 import java.io.IOException;
 import java.nio.file.Files;

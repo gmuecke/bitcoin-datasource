@@ -1,5 +1,6 @@
-package io.devcon5.bitcoin;
+package io.devcon5.bitcoin.grafana;
 
+import io.devcon5.bitcoin.BitcoinHistoryDataVerticle;
 import io.devcon5.util.Config;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.DeploymentOptions;
@@ -9,7 +10,7 @@ import io.vertx.core.json.JsonObject;
 /**
  * This the main verticle for the datasource
  */
-public class BitcoinDatasourceVerticle extends AbstractVerticle {
+public class GrafanaBitcoinJsonDatasource extends AbstractVerticle {
 
     /**
      * Main method for development purposes only. Use CLI to start/deploy verticle for production use.
@@ -19,7 +20,7 @@ public class BitcoinDatasourceVerticle extends AbstractVerticle {
 
         final Vertx vertx = Vertx.vertx();
         final JsonObject config = Config.fromFile("config/config.json");
-        vertx.deployVerticle(BitcoinDatasourceVerticle.class.getName(), new DeploymentOptions().setConfig(config));
+        vertx.deployVerticle(GrafanaBitcoinJsonDatasource.class.getName(), new DeploymentOptions().setConfig(config));
     }
 
     @Override
@@ -27,6 +28,7 @@ public class BitcoinDatasourceVerticle extends AbstractVerticle {
 
         final JsonObject config = Vertx.currentContext().config();
         vertx.deployVerticle(BitcoinHistoryDataVerticle.class.getName(), new DeploymentOptions().setConfig(config));
-        vertx.deployVerticle(HttpServerVerticle.class.getName(), new DeploymentOptions().setConfig(config));
+        vertx.deployVerticle(GrafanaHttpServiceVerticle.class.getName(), new DeploymentOptions().setConfig(config));
+        vertx.deployVerticle(GrafanaQueryVerticle.class.getName(), new DeploymentOptions().setConfig(config));
     }
 }

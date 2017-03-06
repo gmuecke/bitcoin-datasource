@@ -6,6 +6,8 @@ import static org.slf4j.LoggerFactory.getLogger;
 
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
@@ -24,18 +26,26 @@ import io.vertx.core.json.JsonObject;
 import org.slf4j.Logger;
 
 /**
- *
+ * Verticle to read historical bitcoin data from a local file. The file is not read into memory for fast access. Instead
+ * the verticle uses a partial index for fast random access the file. Only chunks of the file are loaded as requested,
+ * while the required chunk is identified using the partial index.
  */
 public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
     private static final Logger LOG = getLogger(BitcoinHistoryDataVerticle.class);
 
-    //TODO add an LRU chunk-cache
+    private static final TreeMap<Long, BitcoinDatapoint> PLACEHOLDER = new TreeMap<>();
+
+    private Map<Long, TreeMap<Long, BitcoinDatapoint>> lruCache = Collections.emptyMap();
     private TreeMap<Long, Long> index = new TreeMap<>();
     private String filename;
     private long filesize;
     private int chunkSize;
     private int lineLength;
+
+    private long cacheHits = 0;
+    private long cacheMisses = 0;
+    private long cacheWait = 0;
 
     @Override
     public void start(final Future<Void> startFuture) throws Exception {
@@ -45,32 +55,41 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         this.filename = config.getString("bitcoinFile");
         this.chunkSize = config.getInteger("chunkSize");
         this.lineLength = config.getInteger("lineLength");
-
         this.filesize = Files.size(Paths.get(filename));
-        final int indexPoints = (int) (filesize / chunkSize);
-        LOG.debug("Bitcoin datafile: {} bytes, {} chunks, {} bytes chunkSize", filesize, indexPoints, chunkSize);
+        int cacheSize = config.getInteger("cacheSize", 16); //16 chunks
+        this.lruCache = new LinkedHashMap<>(cacheSize, 0.75f, true);
+
+        LOG.debug("Bitcoin datafile: {} bytes, {} chunks, {} bytes chunkSize",
+                  filesize,
+                  (filesize / chunkSize),
+                  chunkSize);
 
         //create an index for fast-lookups
-        vertx.fileSystem()
-             .open(filename, new OpenOptions(), openFile -> createPartialIndex(openFile, indexPoints, result -> {
-                 this.index = result;
-                 LOG.info("Created partial index with {} datapoints", this.index.size());
-                 startFuture.complete();
-             }));
+        vertx.fileSystem().open(filename, new OpenOptions(), openFile -> createPartialIndex(openFile, result -> {
+            this.index = result;
+            LOG.info("Created partial index with {} datapoints", this.index.size());
+            startFuture.complete();
+        }));
 
-        vertx.eventBus().consumer("bitcoinPrice", req -> {
+        vertx.eventBus().consumer("bitcoinPrice", req -> readDatapoint((Long) req.body(), dp -> {
+            req.reply(dp);
+        }));
 
-            Long ts = (Long) req.body();
-            LOG.info("Using index of size {}", this.index.size());
-            readDatapoint(ts, req::reply);
-
+        vertx.setPeriodic(5000, t -> {
+            LOG.debug("Cache statistics: hits={}, misses={}, waits={}", cacheHits, cacheMisses, cacheWait);
         });
     }
 
+    /**
+     * Initializes the history verticle by creating a partial index.
+     *
+     * @param openFile
+     * @param indexHandler
+     */
     private void createPartialIndex(final AsyncResult<AsyncFile> openFile,
-                                    final int indexPoints,
                                     final Handler<TreeMap<Long, Long>> indexHandler) {
 
+        final int indexPoints = (int) (this.filesize / this.chunkSize);
         if (openFile.succeeded()) {
             buildIndexTable(openFile.result(), lineLength * 2, indexPoints, chunkSize, indexHandler);
         } else {
@@ -293,6 +312,8 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
     private void readDatapoint(final long timestamp, Handler<JsonObject> datapointHandler) {
 
+        LOG.trace("Reading datapoint at {}", timestamp);
+
         //get the offset of the first chunk or 0 if it's before that
         long startOffset = Optional.ofNullable(this.index.lowerEntry(timestamp))
                                    .map(Map.Entry::getValue)
@@ -301,28 +322,93 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         long endOffset = Optional.ofNullable(this.index.ceilingEntry(timestamp))
                                  .map(Map.Entry::getValue)
                                  .orElseGet(() -> filesize);
-        int chunkSize = (int) (endOffset - startOffset);
+        int chunkLength = (int) (endOffset - startOffset);
 
-        vertx.fileSystem().open(filename, new OpenOptions(), openFile -> {
-            if (openFile.succeeded()) {
-                final AsyncFile file = openFile.result();
-                file.read(Buffer.buffer(chunkSize), 0, startOffset, chunkSize, result -> {
-                    if (result.succeeded()) {
-                        LOG.info("Reading chunk of size {}", chunkSize);
-                        final TreeMap<Long, BitcoinDatapoint> chunkData = new TreeMap<>();
-                        final Buffer chunk = result.result();
-                        readDatapoints(chunk, dp -> chunkData.put(dp.getTimestamp(), dp));
-                        LOG.info("Processed chunk with {} entries", chunkData.size());
-                        datapointHandler.handle(chunkData.lowerEntry(timestamp).getValue().toJson());
-                        file.close();
-                    } else {
-                        throw new RuntimeException(result.cause());
-                    }
-                });
-            } else {
-                throw new RuntimeException("Could not open file", openFile.cause());
+        Future<TreeMap<Long, BitcoinDatapoint>> chunkFuture = Future.future();
+        chunkFuture.setHandler(result -> {
+            if (result.succeeded()) {
+                readDatapointFromCache(timestamp, result.result(), datapointHandler);
             }
         });
+
+        TreeMap<Long, BitcoinDatapoint> insertResult = this.lruCache.putIfAbsent(startOffset, PLACEHOLDER);
+
+        if (insertResult == null) {
+            this.cacheMisses++;
+            vertx.fileSystem().open(filename, new OpenOptions(), openFile -> {
+                if (openFile.succeeded()) {
+                    final AsyncFile file = openFile.result();
+                    file.read(Buffer.buffer(chunkLength), 0, startOffset, chunkLength, result -> {
+                        if (result.succeeded()) {
+                            LOG.trace("Reading chunk of size {} from offset {}", chunkLength, startOffset);
+                            final Buffer chunk = result.result();
+                            final TreeMap<Long, BitcoinDatapoint> chunkData = new TreeMap<>();
+                            readDatapoints(chunk, dp -> chunkData.put(dp.getTimestamp(), dp));
+                            LOG.trace("Processed chunk with {} entries", chunkData.size());
+                            this.lruCache.put(startOffset, chunkData);
+                            chunkFuture.complete(chunkData);
+                            file.close();
+                        } else {
+                            throw new RuntimeException(result.cause());
+                        }
+                    });
+                } else {
+                    throw new RuntimeException("Could not open file", openFile.cause());
+                }
+            });
+        } else if (insertResult == PLACEHOLDER) {
+            //wait until placeholder is replaced
+            vertx.setPeriodic(50, timerId -> {
+                this.cacheWait++;
+                final TreeMap<Long, BitcoinDatapoint> cacheBlock = this.lruCache.get(startOffset);
+                if (cacheBlock != null && cacheBlock != PLACEHOLDER) {
+                    LOG.debug("Placeholder replaced");
+                    vertx.cancelTimer(timerId);
+                    chunkFuture.complete(cacheBlock);
+                }
+            });
+        } else {
+            this.cacheHits++;
+            chunkFuture.complete(insertResult);
+        }
+
+    }
+
+    private void readDatapointFromCache(final long timestamp,
+                                        final TreeMap<Long, BitcoinDatapoint> cacheBlock,
+                                        final Handler<JsonObject> datapointHandler) {
+
+        final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry = Optional.ofNullable(cacheBlock.ceilingEntry(
+                timestamp));
+        final Optional<Map.Entry<Long, BitcoinDatapoint>> lowerEntry = Optional.ofNullable(cacheBlock.lowerEntry(
+                timestamp));
+
+        datapointHandler.handle(lowerEntry.map(Map.Entry::getValue)
+                                          .map(le -> mergeOrGet(timestamp, le, ceilingEntry))
+                                          .orElseGet(() -> getOrFail(timestamp, ceilingEntry)));
+    }
+
+    private JsonObject mergeOrGet(final long timestamp,
+                                  final BitcoinDatapoint le,
+                                  final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry) {
+
+        return ceilingEntry.map(Map.Entry::getValue)
+                           .map(ce -> mergeDatapoints(timestamp, le, ce))
+                           .orElseGet(le::toJson);
+    }
+
+    private JsonObject getOrFail(final long timestamp, final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry) {
+
+        return ceilingEntry.map(Map.Entry::getValue)
+                           .map(BitcoinDatapoint::toJson)
+                           .orElseThrow(() -> new RuntimeException("No Datapoint found for timestamp " + timestamp));
+    }
+
+    private JsonObject mergeDatapoints(final long timestamp, final BitcoinDatapoint le, final BitcoinDatapoint ce) {
+
+        return new JsonObject().put("ts", timestamp)
+                               .put("price", (le.getPrice() + ce.getPrice()) / 2)
+                               .put("volume", (le.getVolume() + ce.getVolume()) / 2);
     }
 
     /**
