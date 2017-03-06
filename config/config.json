@@ -1,0 +1,5 @@
+{
+  "bitcoinFile" : "btceUSD.csv",
+  "chunkSize": 1048576,
+  "lineLength" : 43
+}
