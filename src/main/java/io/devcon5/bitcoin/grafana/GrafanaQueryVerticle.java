@@ -57,14 +57,15 @@ public class GrafanaQueryVerticle extends AbstractVerticle {
                                          })
                                          .collect(Collectors.toList())).setHandler(datapoints -> {
                 if(datapoints.succeeded()) {
-                    LOG.info("Returning response with {} datapoints", datapoints.result().list());
-                    request.reply(datapoints.result()
-                                            .list()
-                                            .stream()
-                                            .map(o -> (JsonObject) o)
-                                            .sorted((j1, j2) -> j1.getLong("ts").compareTo(j2.getLong("ts")))
-                                            .map(jo -> new JsonArray().add(jo.getDouble("price")).add(jo.getLong("ts")))
-                                            .collect(toJsonArray()));
+                    JsonArray result = datapoints.result()
+                                                .list()
+                                                .stream()
+                                                .map(o -> (JsonObject) o)
+                                                .sorted((j1, j2) -> j1.getLong("ts").compareTo(j2.getLong("ts")))
+                                                .map(jo -> new JsonArray().add(jo.getDouble("price")).add(jo.getLong("ts")))
+                                                .collect(toJsonArray());
+                    LOG.info("Returning response with {} datapoints: {}", result.size(), result.encode());
+                    request.reply(result);
                 } else {
                     LOG.error("Query failed", datapoints.cause());
                 }
