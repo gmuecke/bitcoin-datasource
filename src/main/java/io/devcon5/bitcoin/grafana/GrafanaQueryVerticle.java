@@ -32,6 +32,8 @@ public class GrafanaQueryVerticle extends AbstractVerticle {
         this.rangeParser = new RangeParser();
 
         vertx.eventBus().consumer("query", request -> {
+
+            long start = System.currentTimeMillis();
             JsonObject query = (JsonObject) request.body();
 
             final Range range = parseRange(query);
@@ -64,7 +66,8 @@ public class GrafanaQueryVerticle extends AbstractVerticle {
                                                 .sorted((j1, j2) -> j1.getLong("ts").compareTo(j2.getLong("ts")))
                                                 .map(jo -> new JsonArray().add(jo.getDouble("price")).add(jo.getLong("ts")))
                                                 .collect(toJsonArray());
-                    LOG.info("Returning response with {} datapoints: {}", result.size(), result.encode());
+                    LOG.info("Returning response with {} datapoints after {} ms", result.size(),
+                             System.currentTimeMillis() - start);
                     request.reply(result);
                 } else {
                     LOG.error("Query failed", datapoints.cause());

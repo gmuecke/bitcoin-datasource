@@ -53,7 +53,7 @@ public class GrafanaHttpServiceVerticle extends AbstractVerticle{
             if(reply.succeeded()){
                 JsonArray resultSet = ((JsonArray)reply.result().body());
                 JsonArray result = new JsonArray().add(new JsonObject().put("target", "USD").put("datapoints", resultSet));
-                LOG.debug("Sending Response with {} datapoints: {}", resultSet.size(), result.encodePrettily());
+                LOG.debug("Sending Response with {} datapoints", resultSet.size());
                 ctx.response().putHeader("content-type", "application/json").end(result.encode());
             } else {
                 ctx.response().setStatusCode(500).setStatusMessage("Could not process request" + reply.cause().getMessage());

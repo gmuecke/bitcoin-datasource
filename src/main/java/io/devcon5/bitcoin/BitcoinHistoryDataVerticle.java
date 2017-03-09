@@ -256,7 +256,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         //the future that performs the actual read on completion
         final Future refineFuture = Future.future()
-                                          .setHandler(done -> readDatapointFromCache(timestamp, datapointHandler));
+                                          .setHandler(done -> readDatapointDisk(timestamp, datapointHandler));
 
         //check if index refinement is needed (the chunk is still too large)
         if (chunkLength > this.chunkSize * 2) {
@@ -292,6 +292,38 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
     }
 
+    /**
+     * This method performs a direct disk access to read the datapoint.
+     * @param timestamp
+     *  the timestamp to look for
+     * @param datapointHandler
+     *  the handler to be notified when the datapoint has been read.
+     */
+    private void readDatapointDisk(final long timestamp, final Handler<JsonObject> datapointHandler) {
+
+        //get the offset of the first chunk or 0 if it's before that
+        long startOffset = getStartOffset(timestamp);
+        //get offset of the next chunk of size of file if its in the last chunk
+        long endOffset = getEndOffset(timestamp);
+        int chunkLength = (int) (endOffset - startOffset);
+
+        file.read(Buffer.buffer(chunkLength), 0, startOffset, chunkLength, result -> {
+            if (result.succeeded()) {
+                LOG.trace("Reading chunk of size {} from offset {}", chunkLength, startOffset);
+                final Buffer block = result.result();
+                final TreeMap<Long, BitcoinDatapoint> localIndex = new TreeMap<>();
+                readDatapoints(block, dp -> localIndex.put(dp.getTimestamp(), dp));
+                LOG.trace("Processed chunk with {} entries", localIndex.size());
+                readDatapointFromCache(timestamp, localIndex, dp -> {
+                    datapointHandler.handle(dp.toJson());
+                });
+            } else {
+                LOG.error("Could not read chunk from offset {}", startOffset, result.cause());
+            }
+        });
+
+    }
+
     private void readDatapointFromCache(final long timestamp, Handler<JsonObject> datapointHandler) {
 
         LOG.trace("Reading datapoint at {}", timestamp);
@@ -300,8 +332,15 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         final long start = System.currentTimeMillis();
         final Future<BitcoinDatapoint> readFuture = Future.<BitcoinDatapoint>future().setHandler(result -> {
             if (result.succeeded()) {
-                LOG.trace("Retrieved datapoint {} in {} ms",result.result(),  System.currentTimeMillis()-start);
-                datapointHandler.handle(result.result().toJson());
+                BitcoinDatapoint dp = result.result();
+                if(dp != null) {
+                    LOG.trace("Retrieved datapoint {}->{} for in {} ms", timestamp, result.result(), System.currentTimeMillis()-start);
+                    datapointHandler.handle(result.result().toJson());
+                } else {
+                    LOG.warn("Datapoint for ts {} has already been removed from cache", timestamp);
+                    datapointHandler.handle(DATA_PLACEHOLDER.toJson());
+                }
+
             } else {
                 LOG.error("Can not read datapoint for ts={}", timestamp, result.cause());
             }
@@ -334,7 +373,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         } else if (datapoint == DATA_PLACEHOLDER) {
             //wait until datapoint is read
             vertx.setPeriodic(10, timerId -> {
-                BitcoinDatapoint dp = this.dataCache.getOrDefault(timestamp, DATA_PLACEHOLDER);
+                BitcoinDatapoint dp = this.dataCache.get(timestamp);
                 if (dp != DATA_PLACEHOLDER) {
                     vertx.cancelTimer(timerId);
                     readFuture.complete(dp);
@@ -522,7 +561,6 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
     private BitcoinDatapoint mergeDatapoints(final long timestamp,
                                              final BitcoinDatapoint le,
                                              final BitcoinDatapoint ce) {
-
         String ts = String.valueOf(timestamp);
         String pr = String.valueOf((le.getPrice() + ce.getPrice()) / 2);
         String vol = String.valueOf((le.getVolume() + ce.getVolume()) / 2);
@@ -536,10 +574,6 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
                                           .appendString(vol),
                                     ts.length(),
                                     ts.length() + pr.length() + 1);
-
-//        return new JsonObject().put("ts", timestamp)
-//                               .put("price", (le.getPrice() + ce.getPrice()) / 2)
-//                               .put("volume", (le.getVolume() + ce.getVolume()) / 2);
     }
 
     /**

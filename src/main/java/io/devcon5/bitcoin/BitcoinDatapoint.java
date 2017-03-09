@@ -48,7 +48,7 @@ public class BitcoinDatapoint {
      */
     public long getTimestamp() {
 
-        return Long.parseLong(buffer.getString(0, delim1)) * 1000;
+        return Long.parseLong(buffer.getString(0, delim1)) * (delim1 == 10 ? 1000 : 1);
     }
 
     /**
