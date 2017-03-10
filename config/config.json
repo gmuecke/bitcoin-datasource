@@ -2,8 +2,5 @@
   "bitcoinFile" : "btceUSD.csv",
   "chunkSize": 8192,
   "lineLength" : 43,
-  "cache" : {
-    "cacheSize" : 1920,
-    "statsInterval" : 15000
-  }
+  "statsInterval" : 15000
 }
