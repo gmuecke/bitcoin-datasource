@@ -1,44 +1,80 @@
 package io.devcon5.bitcoin;
 
-import io.vertx.core.buffer.Buffer;
-import io.vertx.core.json.JsonObject;
+import java.nio.ByteBuffer;
 
 /**
  * A single datapoint.
  */
 public class BitcoinDatapoint {
 
-    private final long offset;
-    private final Buffer buffer;
-    private final int delim1;
-    private final int delim2;
+    private final long timestamp;
+    private final float price;
+    private final float volume;
 
-    public BitcoinDatapoint(final long offset, final Buffer buffer, final int delim1, final int delim2) {
+    public BitcoinDatapoint(final long timestamp, final float price, final float volume) {
+        this.timestamp = timestamp;
+        this.price = price;
+        this.volume = volume;
+    }
 
-        this.offset = offset;
-        this.buffer = buffer;
-        this.delim1 = delim1;
-        this.delim2 = delim2;
+    public static BitcoinDatapoint fromBuffer(final ByteBuffer buffer, final int priceSeparator, final int volumeSeparator) {
+
+        int volumeEnd = buffer.limit(); //subtract 2 for the 2x','
+
+        byte[] tsData = new byte[priceSeparator];
+        byte[] pData = new byte[volumeSeparator - priceSeparator - 1];
+        byte[] vData = new byte[volumeEnd - volumeSeparator - 1];
+
+        buffer.get(tsData);
+        buffer.get();
+        buffer.get(pData);
+        buffer.get();
+        buffer.get(vData);
+
+        long ts = Long.parseLong(new String(tsData)) * 1000;
+        float price = Float.parseFloat(new String(pData));
+        float volume = Float.parseFloat(new String(vData));
+
+        return new BitcoinDatapoint(ts, price, volume);
     }
 
     /**
-     * The byte-position offset in the source datafile. This is the global offset relative to the datafile and
-     * not within the underlying buffer.
      *
-     * @return the number of bytes this datapoint is located from the beginning of the datafile
-     */
-    public long getOffset() {
-
-        return offset;
-    }
-
-    /**
-     * Creates a Bitcoin BitcoinDatapoint from this datapoint
-     *
+     * @param bod
+     *  the BufferedOffsetDatapoint to parse the data. The buffer of the BOD must start at the beginning of the
+     *  actual data (no lead-in) and must end at some point with the '\n' (newline) character. The remainder
+     *  is ignored.
      * @return
      */
-    public JsonObject toJson() {
-        return new JsonObject().put("ts", getTimestamp()).put("price", getPrice()).put("volume", getVolume());
+    public static BitcoinDatapoint fromOffsetBuffer(BufferedOffsetDatapoint bod){
+
+        ByteBuffer buf = bod.getBuffer();
+        int priceSeparator = -1;
+        int volumeSeparator = -1;
+        int begin = buf.position();
+        byte c = -1;
+
+        /*
+            search the separators. There are two separators ','
+             - between timestamp and price
+             - between price and volume
+             as the separator positions will be used relative to the start of the line, the offset between
+             the initial offset and the beginning of the line is substracted
+         */
+        buf.mark();
+        while(buf.hasRemaining() && (c = buf.get()) != '\n'){
+            if(c == ','){
+                if(priceSeparator == -1 ){
+                    priceSeparator = buf.position() -1;
+                } else if(volumeSeparator == -1){
+                    volumeSeparator = buf.position() -1;
+                }
+            }
+        }
+        int end = buf.position() - (c == '\n' ? 1 : 0);
+        buf.reset();
+
+        return fromBuffer(ByteBuffer.wrap(buf.array(), begin, end-begin), priceSeparator, volumeSeparator);
     }
 
     /**
@@ -48,7 +84,7 @@ public class BitcoinDatapoint {
      */
     public long getTimestamp() {
 
-        return Long.parseLong(buffer.getString(0, delim1)) * (delim1 == 10 ? 1000 : 1);
+        return timestamp;
     }
 
     /**
@@ -56,9 +92,9 @@ public class BitcoinDatapoint {
      *
      * @return
      */
-    public double getPrice() {
+    public float getPrice() {
 
-        return Double.parseDouble(buffer.getString(delim1 + 1, delim2));
+        return price;
     }
 
     /**
@@ -66,9 +102,9 @@ public class BitcoinDatapoint {
      *
      * @return
      */
-    public double getVolume() {
+    public float getVolume() {
 
-        return Double.parseDouble(buffer.getString(delim2 + 1, buffer.length()));
+        return volume;
     }
 
     @Override

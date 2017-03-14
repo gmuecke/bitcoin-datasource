@@ -34,18 +34,30 @@ import org.slf4j.Logger;
 public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
     private static final Logger LOG = getLogger(BitcoinHistoryDataVerticle.class);
-
+    //stats
     private TreeMap<Long, Long> index = new TreeMap<>();
     private Set<Long> refineTracker = new HashSet<>();
-
     //file stats
     private String filename;
     private long filesize;
-    private int lineLength;
+    private int indexChunkSize;
     private AsyncFile file;
     //index chunk size
     private int chunkSize;
     private long refinements = 0;
+
+    /**
+     * Creates a Bitcoin BitcoinDatapoint from this datapoint
+     *
+     * @param dp
+     *         the bitcoin datapoint to convert to json
+     *
+     * @return a json object representing the datapoint
+     */
+    private static JsonObject toJson(final BitcoinDatapoint dp) {
+
+        return new JsonObject().put("ts", dp.getTimestamp()).put("price", dp.getPrice()).put("volume", dp.getVolume());
+    }
 
     @Override
     public void start(final Future<Void> startFuture) throws Exception {
@@ -54,7 +66,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         this.filename = config.getString("bitcoinFile");
         this.filesize = Files.size(Paths.get(this.filename));
-        this.lineLength = config.getInteger("lineLength");
+        this.indexChunkSize = config.getInteger("indexChunkSize");
         this.chunkSize = config.getInteger("chunkSize");
 
         LOG.debug("Bitcoin datafile: {} bytes, {} chunks, {} bytes chunkSize",
@@ -63,21 +75,26 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
                   chunkSize);
 
         //create an index for fast-lookups
+        final long start = System.currentTimeMillis();
         vertx.fileSystem().open(this.filename, new OpenOptions(), openFile -> createPartialIndex(openFile, result -> {
             this.index = result;
-            LOG.info("Created partial index with {} datapoints", this.index.size());
+            LOG.info("Created partial index with {} datapoints in {} ms", this.index.size(), System.currentTimeMillis()-start);
             startFuture.complete();
         }));
 
         vertx.eventBus().consumer("bitcoinPrice", req -> readDatapoint((Long) req.body(), req::reply));
         final long interval = config.getInteger("statsInterver", 10000);
+
+        //statistics monitor
         vertx.setPeriodic(interval, t -> {
-            LOG.info("Index statistics: { entries:{}, refinements:{}, blocksInRefinement:{}}",
+            LOG.info("Index statistics: { entries:{}, refinements:{}, blocksInRefinement:{}, ref:{}}",
                      this.index.size(),
                      this.refinements,
-                     this.refineTracker.size());
+                     this.refineTracker.size(),
+                     this.refineTracker);
 
         });
+
     }
 
     @Override
@@ -100,7 +117,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         final int indexPoints = (int) (this.filesize / (this.chunkSize * 16));
         if (openFile.succeeded()) {
             this.file = openFile.result();
-            buildIndexTable(openFile.result(), 0, lineLength * 2, indexPoints, (this.chunkSize * 16), indexHandler);
+            buildIndexTable(openFile.result(), 0, indexChunkSize, indexPoints, (this.chunkSize * 16), indexHandler);
         } else {
             vertx.close();
             throw new RuntimeException("can not read file " + filename, openFile.cause());
@@ -168,6 +185,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         final Future<IndexPoint> indexPointFuture = Future.future();
         final Buffer readBuffer = Buffer.buffer(len);
+        this.refineTracker.add(offset);
 
         final long start = System.currentTimeMillis();
         file.read(readBuffer, 0, offset, len, buildIndexPoint(offset, ip -> {
@@ -178,6 +196,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
              */
             if (!indexPointFuture.isComplete()) {
                 LOG.debug("Read index point for {} in {} ms", ip.timestamp, System.currentTimeMillis() - start);
+                this.refineTracker.remove(offset);
                 indexPointFuture.complete(ip);
             }
         }));
@@ -203,7 +222,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
             if (result.succeeded()) {
                 final Buffer buf = result.result();
                 readDatapoints(buf, dp -> {
-                    IndexPoint ip = new IndexPoint(dp.getTimestamp(), offset + dp.getOffset());
+                    IndexPoint ip = IndexPoint.of(offset, dp);
                     LOG.trace("Creating index point {}", ip);
                     indexPointHandler.handle(ip);
                 });
@@ -231,7 +250,8 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         int chunkLength = (int) (endOffset - startOffset);
 
         //the future that performs the actual read on completion
-        final Future refineFuture = Future.future().setHandler(done -> readDatapointDisk(timestamp, datapointHandler));
+        final Future refineFuture = Future.future()
+                                          .setHandler(done -> readDatapointFromDisk(timestamp, datapointHandler));
 
         //check if index refinement is needed (the chunk is still too large)
         if (chunkLength > this.chunkSize * 2) {
@@ -254,7 +274,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
                 this.refineTracker.add(startOffset);
                 final int indexPoints = chunkLength / this.chunkSize;
                 final long start = System.currentTimeMillis();
-                buildIndexTable(this.file, startOffset, lineLength * 2, indexPoints, this.chunkSize, subIndex -> {
+                buildIndexTable(this.file, startOffset, indexChunkSize, indexPoints, this.chunkSize, subIndex -> {
                     this.index.putAll(subIndex);
                     this.refineTracker.remove(startOffset);
                     LOG.trace("Refinement of block {} finished in {} ms",
@@ -271,7 +291,6 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
     }
 
-
     /**
      * This method performs a direct disk access to read the datapoint.
      *
@@ -280,7 +299,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
      * @param datapointHandler
      *         the handler to be notified when the datapoint has been read.
      */
-    private void readDatapointDisk(final long timestamp, final Handler<JsonObject> datapointHandler) {
+    private void readDatapointFromDisk(final long timestamp, final Handler<JsonObject> datapointHandler) {
 
         //get the offset of the first chunk or 0 if it's before that
         long startOffset = getStartOffset(timestamp);
@@ -293,14 +312,18 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
             if (result.succeeded()) {
                 final Buffer block = result.result();
                 final TreeMap<Long, BitcoinDatapoint> localIndex = new TreeMap<>();
-                readDatapoints(block, dp -> localIndex.put(dp.getTimestamp(), dp));
+
+                readDatapoints(block, dp -> {
+                    BitcoinDatapoint btcDp = BitcoinDatapoint.fromOffsetBuffer(dp);
+                    localIndex.put(btcDp.getTimestamp(), btcDp);
+                });
                 LOG.debug("Processed chunk {} of size {} with {} entries in {} ms",
                           toHexString(startOffset),
                           chunkLength,
                           localIndex.size(),
                           System.currentTimeMillis() - start);
                 readDatapointFromCache(timestamp, localIndex, dp -> {
-                    datapointHandler.handle(dp.toJson());
+                    datapointHandler.handle(toJson(dp));
                 });
             } else {
                 LOG.error("Could not read chunk {}", toHexString(startOffset), result.cause());
@@ -368,6 +391,47 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
     }
 
     /**
+     * Interpolates datapoint if for the given lower datapoint a ceilingEntry exists, otherwise returns the
+     * lower datapoint
+     *
+     * @param timestamp
+     *         the timestamp for which the datapoint should be determined
+     * @param le
+     *         the lower entry for the timestamp
+     * @param ceilingEntry
+     *         the optional ceiling entry for the timestamp
+     *
+     * @return the interpolated datapoint or the lower entry
+     */
+    private BitcoinDatapoint interpolateOrGet(final long timestamp,
+                                              final BitcoinDatapoint le,
+                                              final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry) {
+
+        return ceilingEntry.map(Map.Entry::getValue)
+                           .map(ce -> interpolateDatapoint(timestamp, le, ce))
+                           .orElseGet(() -> le);
+    }
+
+    /**
+     * Returns the ceiling datapoint or throws an exception if there is no ceiling datapoint for the given
+     * timestamp. The exception case can only occur, if there are no datapoints in the file. This method should
+     * be used after reading a lower datapoint without success
+     *
+     * @param timestamp
+     *         the timestamp for which to retrieve the datapoint
+     * @param ceilingEntry
+     *         the next bigger entry for the datapoint
+     *
+     * @return the datapoint at the requested position
+     */
+    private BitcoinDatapoint getOrFail(final long timestamp,
+                                       final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry) {
+
+        return ceilingEntry.map(Map.Entry::getValue)
+                           .orElseThrow(() -> new RuntimeException("No Datapoint found for timestamp " + timestamp));
+    }
+
+    /**
      * One line has the format:
      * <pre>
      *     timestamp,price,volume
@@ -389,54 +453,15 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
      * @param handler
      *         the handle that is notified for each read datapoint
      */
-    private void readDatapoints(final Buffer buffer, Handler<BitcoinDatapoint> handler) {
+    private void readDatapoints(final Buffer buffer, Handler<BufferedOffsetDatapoint> handler) {
 
         final int len = buffer.length();
         int pos = 0;
 
-        while (pos < len) {
+        while (pos < len && pos != -1) {
             pos = readNextLine(buffer, pos, handler);
         }
 
-    }
-
-    /**
-     * Interpolates datapoint if for the given lower datapoint a ceilingEntry exists, otherwise returns the
-     * lower datapoint
-     * @param timestamp
-     *  the timestamp for which the datapoint should be determined
-     * @param le
-     *  the lower entry for the timestamp
-     * @param ceilingEntry
-     *  the optional ceiling entry for the timestamp
-     * @return
-     *  the interpolated datapoint or the lower entry
-     */
-    private BitcoinDatapoint interpolateOrGet(final long timestamp,
-                                              final BitcoinDatapoint le,
-                                              final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry) {
-
-        return ceilingEntry.map(Map.Entry::getValue)
-                           .map(ce -> interpolateDatapoint(timestamp, le, ce))
-                           .orElseGet(() -> le);
-    }
-
-    /**
-     * Returns the ceiling datapoint or throws an exception if there is no ceiling datapoint for the given
-     * timestamp. The exception case can only occur, if there are no datapoints in the file. This method should
-     * be used after reading a lower datapoint without success
-     * @param timestamp
-     *  the timestamp for which to retrieve the datapoint
-     * @param ceilingEntry
-     *  the next bigger entry for the datapoint
-     * @return
-     *  the datapoint at the requested position
-     */
-    private BitcoinDatapoint getOrFail(final long timestamp,
-                                       final Optional<Map.Entry<Long, BitcoinDatapoint>> ceilingEntry) {
-
-        return ceilingEntry.map(Map.Entry::getValue)
-                           .orElseThrow(() -> new RuntimeException("No Datapoint found for timestamp " + timestamp));
     }
 
     /**
@@ -452,12 +477,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
      *
      * @return the position at the end of the datapoint
      */
-    private int readNextLine(final Buffer buffer, int initialOffset, final Handler<BitcoinDatapoint> handler) {
-
-        final int len = buffer.length();
-        final int[] separators = { -1, -1 };
-        int ptr = 0;
-        int current;
+    private int readNextLine(final Buffer buffer, int initialOffset, final Handler<BufferedOffsetDatapoint> handler) {
 
         /*
             skip to the beginning of a new line and remember the starting offset
@@ -473,31 +493,21 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
             4: separator2: ',' followed by the volume
             5: position at the end of the line (another linebreak) followed by the next line. Might be complete
          */
-        final int offset = findLineBegin(buffer, initialOffset);
-        int pos = offset;
-
-        /*
-            search the separators. There are two separators ','
-             - between timestamp and price
-             - between price and volume
-             as the separator positions will be used relative to the start of the line, the offset between
-             the initial offset and the beginning of the line is substracted
-         */
-        while (++pos < len && (current = buffer.getByte(pos)) != '\n') {
-            if (current == ',' && ptr < 2) {
-                separators[ptr++] = pos - offset;
-            }
+        final int startOffset = findLineBegin(buffer, initialOffset);
+        if (startOffset == -1) {
+            return buffer.length();
         }
-        //if both separators were found before the beginning of the new line
-        if (ptr == 2 && separators[0] != separators[1]) {
-            handler.handle(new BitcoinDatapoint(offset, buffer.getBuffer(offset, pos), separators[0], separators[1]));
+        final int endOffset = findLineBegin(buffer, startOffset);
+        if (endOffset == -1) {
+            return buffer.length();
         }
-        return pos;
+        handler.handle(new BufferedOffsetDatapoint(startOffset + initialOffset,
+                                                   buffer.getBuffer(startOffset, endOffset-1).getByteBuf().nioBuffer()));
+        return endOffset;
     }
 
     /**
-     * Interpolates a datapoint from two given datapoints. The method takes the distance of the timestamp to one
-     * of the boundary datapoints into account for calculating the distance.
+     * Interpolates a datapoint from two given datapoints. The method applies linear interpolation.
      *
      * @param timestamp
      *         the timestamp for which the interpolated datapoint should be created
@@ -514,24 +524,15 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         //calculate the proportion of the distance of the timestamp to the lower entry in relation
         //to the total interval
-        double le_pc = ((double) (timestamp - le.getTimestamp()) / (ce.getTimestamp() - le.getTimestamp()));
+        float le_pc = ((float) (timestamp - le.getTimestamp()) / (ce.getTimestamp() - le.getTimestamp()));
         //calculate the remaining propportion of the distance of the timestamp to the ceiling entry in
         //relation to the total interval
-        double ce_pc = 1.0 - le_pc;
+        float ce_pc = 1.0f - le_pc;
 
-        String ts = String.valueOf(timestamp);
-        String pr = String.valueOf((le.getPrice() * le_pc + ce.getPrice() * ce_pc) );
-        String vol = String.valueOf((le.getVolume() * le_pc + ce.getVolume()) * ce_pc );
+        float price = le.getPrice() * le_pc + ce.getPrice() * ce_pc;
+        float volume = (le.getVolume() * le_pc + ce.getVolume()) * ce_pc;
 
-        return new BitcoinDatapoint(-1L,
-                                    Buffer.buffer(43)
-                                          .appendString(ts)
-                                          .appendString(",")
-                                          .appendString(pr)
-                                          .appendString(",")
-                                          .appendString(vol),
-                                    ts.length(),
-                                    ts.length() + pr.length() + 1);
+        return new BitcoinDatapoint(timestamp, price, volume);
     }
 
     /**
@@ -548,36 +549,14 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         final int len = buffer.length();
         int pos = start;
-        while (pos < len && buffer.getByte(pos++) != '\n') {
+        byte c = -1;
+        while (pos < len && (c = buffer.getByte(pos++)) != '\n') {
             //noop
         }
+        if (c != '\n') {
+            return -1;
+        }
         return pos;
-    }
-
-    /**
-     * Represent a point in the datafile with a timestamp and a byte-offset. So when a timestamp is searched for,
-     * the corresponding byte offset can be returned.
-     */
-    private static class IndexPoint {
-
-        final long timestamp;
-        final long offset;
-
-        public IndexPoint(final long timestamp, final long offset) {
-
-            this.timestamp = timestamp;
-            this.offset = offset;
-        }
-
-        @Override
-        public String toString() {
-
-            final StringBuilder sb = new StringBuilder("IndexPoint{");
-            sb.append("timestamp=").append(timestamp);
-            sb.append(", offset=").append(offset);
-            sb.append('}');
-            return sb.toString();
-        }
     }
 
 }

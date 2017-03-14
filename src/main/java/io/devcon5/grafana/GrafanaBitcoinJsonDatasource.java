@@ -1,4 +1,4 @@
-package io.devcon5.bitcoin.grafana;
+package io.devcon5.grafana;
 
 import io.devcon5.bitcoin.BitcoinHistoryDataVerticle;
 import io.devcon5.util.Config;

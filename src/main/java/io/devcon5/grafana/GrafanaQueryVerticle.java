@@ -1,4 +1,4 @@
-package io.devcon5.bitcoin.grafana;
+package io.devcon5.grafana;
 
 import static io.devcon5.util.JsonFactory.toJsonArray;
 import static org.slf4j.LoggerFactory.getLogger;
@@ -6,8 +6,6 @@ import static org.slf4j.LoggerFactory.getLogger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-import io.devcon5.grafana.Range;
-import io.devcon5.grafana.RangeParser;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.CompositeFuture;
 import io.vertx.core.Future;

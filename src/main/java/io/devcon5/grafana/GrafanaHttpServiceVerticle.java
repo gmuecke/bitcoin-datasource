@@ -1,4 +1,4 @@
-package io.devcon5.bitcoin.grafana;
+package io.devcon5.grafana;
 
 import static org.slf4j.LoggerFactory.getLogger;
 
