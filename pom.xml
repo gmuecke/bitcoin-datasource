@@ -108,6 +108,7 @@
             <artifactId>junit</artifactId>
             <scope>test</scope>
         </dependency>
+        <dependency> <groupId>io.devcon5</groupId> <artifactId>jackson-jsonb-provider</artifactId> <version>1.0</version> <type>pom</type> </dependency>
     </dependencies>
 
     <build>

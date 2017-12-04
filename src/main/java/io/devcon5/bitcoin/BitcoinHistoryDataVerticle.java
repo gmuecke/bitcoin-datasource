@@ -45,6 +45,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
     //index chunk size
     private int chunkSize;
     private long refinements = 0;
+    private int partialIndexFactor;
 
     /**
      * Creates a Bitcoin BitcoinDatapoint from this datapoint
@@ -68,6 +69,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
         this.filesize = Files.size(Paths.get(this.filename));
         this.indexChunkSize = config.getInteger("indexChunkSize");
         this.chunkSize = config.getInteger("chunkSize");
+        this.partialIndexFactor = config.getInteger("partialIndexFactor");
 
         LOG.debug("Bitcoin datafile: {} bytes, {} chunks, {} bytes chunkSize",
                   filesize,
@@ -114,10 +116,10 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         //we only create a coarse-grained index covering larger blocks than the configured chunk size
         //on accessing any of the chunks, the index gets more fine grained
-        final int indexPoints = (int) (this.filesize / (this.chunkSize * 16));
+        final int indexPoints = (int) (this.filesize / (this.chunkSize * this.partialIndexFactor));
         if (openFile.succeeded()) {
             this.file = openFile.result();
-            buildIndexTable(openFile.result(), 0, indexChunkSize, indexPoints, (this.chunkSize * 16), indexHandler);
+            buildIndexTable(openFile.result(), 0, indexChunkSize, indexPoints, (this.chunkSize), indexHandler);
         } else {
             vertx.close();
             throw new RuntimeException("can not read file " + filename, openFile.cause());
@@ -195,7 +197,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
              *  are in the read buffer which will trigger the handler twice.
              */
             if (!indexPointFuture.isComplete()) {
-                LOG.debug("Read index point for {} in {} ms", ip.timestamp, System.currentTimeMillis() - start);
+                LOG.trace("Read index point for {} in {} ms", ip.timestamp, System.currentTimeMillis() - start);
                 this.refineTracker.remove(offset);
                 indexPointFuture.complete(ip);
             }
@@ -361,7 +363,7 @@ public class BitcoinHistoryDataVerticle extends AbstractVerticle {
 
         return Optional.ofNullable(this.index.ceilingEntry(timestamp))
                        .map(Map.Entry::getValue)
-                       .orElseGet(() -> filesize);
+                       .orElse(filesize);
     }
 
     /**

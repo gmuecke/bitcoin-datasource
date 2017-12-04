@@ -1,6 +1,7 @@
 {
   "bitcoinFile" : "btceUSD.csv",
-  "chunkSize": 8192,
+  "chunkSize": 4096,
+  "partialIndexFactor" : 4,
   "indexChunkSize" : 128,
   "statsInterval" : 15000
 }

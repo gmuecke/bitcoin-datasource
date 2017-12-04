@@ -6,7 +6,7 @@ import java.nio.ByteBuffer;
  * Represent a point in the datafile with a timestamp and a byte-offset. So when a timestamp is searched for,
  * the corresponding byte offset can be returned.
  */
-class IndexPoint {
+public class IndexPoint {
 
     final long timestamp;
     final long offset;
